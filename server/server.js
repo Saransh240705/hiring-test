@@ -37,6 +37,17 @@ const initializeDatabase=async () => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users (id)
     );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      todo_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      details TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users (id),
+      FOREIGN KEY (todo_id) REFERENCES todos (id)
+    );
   `);
 
     console.log('Database initialized');
@@ -141,6 +152,14 @@ app.post('/api/todos', authenticateToken, async (req, res) => {
         );
 
         const todoId=result.lastID;
+        
+        // Add audit log for todo creation
+        await db.run(
+            `INSERT INTO audit_logs (user_id, todo_id, action, details)
+             VALUES (?, ?, ?, ?)`,
+            [req.user.id, todoId, 'CREATE', JSON.stringify({ title, description })]
+        );
+
         const createdTodo=await db.get('SELECT * FROM todos WHERE id = ?', [todoId]);
 
         res.status(201).json(createdTodo);
@@ -155,7 +174,6 @@ app.put('/api/todos/:id', authenticateToken, async (req, res) => {
         const { id }=req.params;
         const { title, description, completed }=req.body;
 
-
         const currentTodo=await db.get(
             'SELECT * FROM todos WHERE id = ? AND user_id = ?',
             [id, req.user.id]
@@ -165,19 +183,32 @@ app.put('/api/todos/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Todo not found' });
         }
 
-
         const updatedTodo={
             title: title!==undefined? title:currentTodo.title,
             description: description!==undefined? description:currentTodo.description,
             completed: completed!==undefined? (completed? 1:0):currentTodo.completed
         };
 
+        // Track changes for audit log
+        const changes = {};
+        if (title !== undefined && title !== currentTodo.title) changes.title = { from: currentTodo.title, to: title };
+        if (description !== undefined && description !== currentTodo.description) changes.description = { from: currentTodo.description, to: description };
+        if (completed !== undefined && completed !== currentTodo.completed) changes.completed = { from: currentTodo.completed, to: completed };
 
         await db.run(
             `UPDATE todos SET title = ?, description = ?, completed = ?
        WHERE id = ? AND user_id = ?`,
             [updatedTodo.title, updatedTodo.description, updatedTodo.completed, id, req.user.id]
         );
+
+        // Add audit log for todo update
+        if (Object.keys(changes).length > 0) {
+            await db.run(
+                `INSERT INTO audit_logs (user_id, todo_id, action, details)
+                 VALUES (?, ?, ?, ?)`,
+                [req.user.id, id, 'UPDATE', JSON.stringify(changes)]
+            );
+        }
 
         const result=await db.get('SELECT * FROM todos WHERE id = ?', [id]);
 
@@ -192,7 +223,6 @@ app.delete('/api/todos/:id', authenticateToken, async (req, res) => {
     try {
         const { id }=req.params;
 
-
         const currentTodo=await db.get(
             'SELECT * FROM todos WHERE id = ? AND user_id = ?',
             [id, req.user.id]
@@ -202,6 +232,12 @@ app.delete('/api/todos/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Todo not found' });
         }
 
+        // Add audit log for todo deletion
+        await db.run(
+            `INSERT INTO audit_logs (user_id, todo_id, action, details)
+             VALUES (?, ?, ?, ?)`,
+            [req.user.id, id, 'DELETE', JSON.stringify({ title: currentTodo.title })]
+        );
 
         await db.run(
             'DELETE FROM todos WHERE id = ? AND user_id = ?',
@@ -209,6 +245,24 @@ app.delete('/api/todos/:id', authenticateToken, async (req, res) => {
         );
 
         res.status(200).json({ message: 'Todo deleted successfully' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Add new endpoint to fetch audit logs
+app.get('/api/audit-logs', authenticateToken, async (req, res) => {
+    try {
+        const logs = await db.all(
+            `SELECT al.*, t.title as todo_title 
+             FROM audit_logs al 
+             LEFT JOIN todos t ON al.todo_id = t.id 
+             WHERE al.user_id = ? 
+             ORDER BY al.created_at DESC`,
+            [req.user.id]
+        );
+        res.status(200).json(logs);
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Server error' });
